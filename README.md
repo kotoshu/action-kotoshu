@@ -70,3 +70,26 @@ jobs:
 ## License
 
 BSD-2-Clause, same as Kotoshu.
+
+
+## Coming with the next gem release
+
+The current published gem (0.7.0) supports the six original full-feature
+languages. The next release (tracking `main`) brings:
+
+- **19 full-feature languages** — `prewarm_languages: "it nl pl tr el uk ..."`
+  will work once the setup gate widens.
+- **Directory mode** — `files: "."` will walk the whole tree through the
+  gem itself (respecting `.gitignore`, skipping `node_modules`/`vendor`),
+  replacing the action's bash glob expansion.
+- **Baselines** — freeze existing errors and fail only on new ones:
+
+```yaml
+- uses: kotoshu/action-kotoshu@v1
+  with:
+    files: "."
+    baseline: .kotoshu-baseline.json
+```
+
+Generate the baseline with `kotoshu baseline init . > .kotoshu-baseline.json`
+and commit it.
