@@ -1,0 +1,71 @@
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-fixture:
+    # Runs this action against test/fixtures/fixture-repo: two known
+    # misspellings covered by a committed baseline, one gitignored file
+    # that must never reach the report. The gem version is pinned so the
+    # committed baseline stays exact.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required for SARIF upload
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baseline run (every fixture error baselined; must pass)
+        id: baselined
+        uses: ./
+        with:
+          files: test/fixtures/fixture-repo
+          language: en
+          baseline: test/fixtures/fixture-repo/.kotoshu-baseline.json
+          version: 0.9.2
+          output_path: baseline.sarif
+          category: selftest-baseline
+
+      - name: Assert the baseline suppressed every flagged entry
+        run: |
+          set -euo pipefail
+          [ "${{ steps.baselined.outputs.error-count }}" = "0" ]
+          [ -s baseline.sarif ]
+          ruby -rjson -e '
+            results = JSON.parse(File.read("baseline.sarif"))["runs"].flat_map { |r| r["results"] }
+            baselined = results.count { |r|
+              r["level"] == "note" &&
+                (r["suppressions"] || []).any? { |s| s["justification"] == "baseline" }
+            }
+            warnings = results.count { |r| r["level"] == "warning" }
+            abort "expected 2 baseline notes, got #{baselined}" unless baselined == 2
+            abort "expected 0 warnings, got #{warnings}" unless warnings.zero?
+          '
+          if grep -q "ignored.md" baseline.sarif; then
+            echo "gitignored fixture file leaked into the report"
+            exit 1
+          fi
+
+      - name: No-baseline run (must fail with both errors)
+        id: raw
+        uses: ./
+        with:
+          files: test/fixtures/fixture-repo
+          language: en
+          version: 0.9.2
+          output_path: raw.sarif
+          category: selftest-raw
+        continue-on-error: true
+
+      - name: Assert the no-baseline run failed
+        run: |
+          set -euo pipefail
+          [ "${{ steps.raw.outcome }}" = "failure" ]
+          [ "${{ steps.raw.outputs.error-count }}" = "2" ]
