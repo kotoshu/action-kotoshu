@@ -107,10 +107,13 @@ the baseline.
    `kotoshu check` directly so the gem walks directories.
 6. Forwards `--include`, `--exclude`, `--baseline`, `--show-suppressed`
    when set; otherwise lets `kotoshu check` use its defaults.
-7. Reads the failing error count from the report
+7. Merges the per-file SARIF runs into a single run (code scanning no
+   longer combines multiple runs per category; each result keeps its
+   own file URI).
+8. Reads the failing error count from the report
    (`errorCount` for JSON; warnings-only count for SARIF; last-line
    summary for text).
-8. Uploads SARIF to the GitHub Security tab via
+9. Uploads SARIF to the GitHub Security tab via
    `codeql-action/upload-sarif` and uploads the report as an artifact.
 
 Exit codes from `kotoshu check`:
@@ -151,7 +154,7 @@ jobs:
 | v1 | v2 | Why |
 |---|---|---|
 | `files: .` warned `No files matched` and ran nothing | `files: .` walks the whole tree (gitignore-aware) | v1 expanded a literal `.` to `[ -f . ]` and dropped it; the gem now does the walk |
-| `kotoshu check` ran per file with JSON/SARIF concatenation in the wrapper | One `kotoshu check` invocation emits a combined document | Matches the gem directory mode (one run per file in SARIF, one `files[]` in JSON) |
+| `kotoshu check` ran per file with JSON/SARIF concatenation in the wrapper | One `kotoshu check` invocation emits a combined document; the wrapper merges per-file SARIF runs into a single run before upload | Matches the gem directory mode; code scanning no longer accepts multiple runs per category in one file |
 | Hard errors (usage, missing language) were silently swallowed per file | Gem exit codes `2` and `3` fail the step | Surfaces real failures instead of zero-count success |
 | `text` format produced nothing in the log | `text` is `tee`d into the report and shown in the step log | v1 captured per-file stdout and discarded it for text |
 | Output paths for text were always empty | All formats write the report to `output_path` | Easier to attach the report to a workflow run |

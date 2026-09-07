@@ -188,6 +188,30 @@ runs:
             > "$OUTPUT_PATH" || rc=$?
         fi
 
+        # Directory mode emits one SARIF run per file; code scanning no
+        # longer combines multiple runs in one file per category, so
+        # merge them into a single run (shared tool descriptor; each
+        # result keeps its own artifactLocation URI). Skipped silently
+        # when no parseable report exists (e.g. a usage error run) so
+        # the gem exit code still decides the step outcome.
+        if [ "$FORMAT" = "sarif" ]; then
+          ruby -rjson -e '
+            begin
+              doc = JSON.parse(File.read(ARGV[0]))
+            rescue JSON::ParserError, Errno::ENOENT
+              exit
+            end
+            runs = doc["runs"]
+            if runs.is_a?(Array) && runs.size > 1 && runs.first.is_a?(Hash)
+              doc["runs"] = [{
+                "tool" => runs.first["tool"],
+                "results" => runs.flat_map { |r| (r || {})["results"] || [] }
+              }]
+              File.write(ARGV[0], JSON.pretty_generate(doc))
+            end
+          ' "$OUTPUT_PATH" || true
+        fi
+
         # Failing error count from the report (new errors only when a
         # baseline is set; suppressed entries are notes, not warnings).
         error_count="$(ruby -e '
