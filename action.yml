@@ -1,12 +1,12 @@
 name: "Kotoshu spell check"
-description: "Run the Kotoshu spell checker on files in your repository. Caches dictionaries between runs and uploads SARIF results to the GitHub Security tab."
+description: "Run the Kotoshu spell checker on your repository via the gem directory mode (gitignore-aware walk). Caches dictionaries between runs, supports baselines, and uploads SARIF results to the GitHub Security tab."
 branding:
   icon: "check-circle"
   color: "blue"
 
 inputs:
   files:
-    description: "Files or glob patterns to check (space-separated). Default: all supported files in the repo."
+    description: "Files, directories, or glob patterns to check (space-separated). Directories are walked by the gem itself (gitignore-aware, skips .git/node_modules/vendor/target). Default: the whole repository."
     required: false
     default: "."
   language:
@@ -17,12 +17,32 @@ inputs:
     description: "Output format: text, json, or sarif."
     required: false
     default: "sarif"
+  baseline:
+    description: "Baseline JSON file (see kotoshu baseline init). Errors it covers pass; only new errors fail the check. Paths must be relative to the repository root, matching how the action runs the check."
+    required: false
+    default: ""
+  include:
+    description: "Directory mode only: check just files matching these globs (space-separated; replaces the known-extension default)."
+    required: false
+    default: ""
+  exclude:
+    description: "Directory mode only: skip files matching these globs (space-separated; always wins over include)."
+    required: false
+    default: ""
+  show_suppressed:
+    description: "Also list entries suppressed by inline directives or the baseline (SARIF notes; does not affect pass/fail)."
+    required: false
+    default: "false"
   fail_on_error:
-    description: "Fail the workflow step if any spelling errors are found."
+    description: "Fail the workflow step if failing spelling errors are found (with a baseline: only errors the baseline does not cover)."
     required: false
     default: "true"
+  category:
+    description: "SARIF upload category, also used to scope the report artifact name (used when format is sarif or json)."
+    required: false
+    default: "kotoshu"
   version:
-    description: "kotoshu gem version to install (empty = latest)."
+    description: "kotoshu gem version to install (empty = latest). Must be >= 0.8.0 (directory mode and baselines)."
     required: false
     default: ""
   prewarm_languages:
@@ -34,16 +54,16 @@ inputs:
     required: false
     default: "true"
   output_path:
-    description: "Where to write SARIF/JSON output for upload."
+    description: "Where to write the report for upload (all formats)."
     required: false
     default: "kotoshu-results.sarif"
 
 outputs:
   sarif-path:
-    description: "Path to the SARIF report (empty if format != sarif)."
+    description: "Path to the SARIF/JSON report (empty when format is text)."
     value: ${{ steps.run.outputs.sarif-path }}
   error-count:
-    description: "Number of spelling errors found."
+    description: "Number of failing spelling errors (new errors only, when a baseline is set)."
     value: ${{ steps.run.outputs.error-count }}
 
 runs:
@@ -75,6 +95,15 @@ runs:
         fi
         kotoshu --version
 
+        # v2 of this action relies on the gem directory mode and
+        # baselines, both introduced in kotoshu 0.8.0.
+        installed="$(kotoshu --version | awk '{print $NF}')"
+        oldest="$(printf '%s\n0.8.0\n' "$installed" | sort -V | head -1)"
+        if [ "$oldest" != "0.8.0" ]; then
+          echo "::error::action v2 requires kotoshu >= 0.8.0, found $installed. Pin a newer version with the version input."
+          exit 1
+        fi
+
     - name: Pre-warm languages
       shell: bash
       env:
@@ -98,118 +127,117 @@ runs:
         FILES: ${{ inputs.files }}
         LANGUAGE: ${{ inputs.language }}
         FORMAT: ${{ inputs.format }}
+        BASELINE: ${{ inputs.baseline }}
+        INCLUDE: ${{ inputs.include }}
+        EXCLUDE: ${{ inputs.exclude }}
+        SHOW_SUPPRESSED: ${{ inputs.show_suppressed }}
         OUTPUT_PATH: ${{ inputs.output_path }}
         FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
       run: |
         set -euo pipefail
-        # Expand the files glob in bash so users can pass "*.md" or "docs/**/*.adoc"
-        shopt -s nullglob globstar
-        expanded=()
-        for pat in $FILES; do
-          for f in $pat; do
-            [ -f "$f" ] && expanded+=("$f")
-          done
-        done
 
-        if [ ${#expanded[@]} -eq 0 ]; then
-          echo "::warning::No files matched '$FILES'"
+        # Build the target list. Globs (tokens containing *, ?, or [)
+        # are expanded here; directories and plain paths are passed
+        # through so the gem directory mode walks them (gitignore-aware).
+        shopt -s nullglob globstar
+        targets=()
+        saw_token=0
+        for token in $FILES; do
+          saw_token=1
+          case "$token" in
+            *[\*\?\[]*)
+              for f in $token; do
+                targets+=("$f")
+              done
+              ;;
+            *)
+              targets+=("$token")
+              ;;
+          esac
+        done
+        shopt -u nullglob globstar
+
+        if [ "$saw_token" -eq 0 ] || [ ${#targets[@]} -eq 0 ]; then
+          echo "::warning::No targets to check (files: '$FILES')"
           echo "error-count=0" >> "$GITHUB_OUTPUT"
+          echo "sarif-path=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        # Use a temp file for the report so we can read its size for diagnostics.
-        TMP_REPORT="$(mktemp -t kotoshu.XXXXXX.${FORMAT})"
-        trap 'rm -f "$TMP_REPORT"' EXIT
-
-        # kotoshu check writes a per-file report; concatenate to one SARIF/JSON
-        # document by running with --format once and capturing stdout.
-        ran_with_errors=0
-        combined_report="$TMP_REPORT"
-        if [ "$FORMAT" = "sarif" ]; then
-          # SARIF root object that wraps multiple runs
-          printf '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[' > "$combined_report"
-        elif [ "$FORMAT" = "json" ]; then
-          printf '{"results":[' > "$combined_report"
+        # Map inputs onto kotoshu check flags (kotoshu help check).
+        args=()
+        for glob in $INCLUDE; do args+=(--include "$glob"); done
+        for glob in $EXCLUDE; do args+=(--exclude "$glob"); done
+        if [ -n "$BASELINE" ]; then
+          args+=(--baseline "$BASELINE")
+        fi
+        if [ "$SHOW_SUPPRESSED" = "true" ]; then
+          args+=(--show-suppressed)
         fi
 
-        first=1
-        error_total=0
-        for f in "${expanded[@]}"; do
-          per_out="$(kotoshu check "$f" --format "$FORMAT" --language "$LANGUAGE" 2>/dev/null || true)"
-          per_err_count="$(echo "$per_out" | ruby -rjson -e '
-            begin
-              doc = JSON.parse(STDIN.read)
-              if doc["runs"]
-                puts doc["runs"].sum { |r| (r["results"] || []).length }
-              elsif doc["results"]
-                puts doc["results"].length
-              elsif doc["errors"]
-                puts doc["errors"].length
-              else
-                puts 0
+        # Exit codes: 0 no errors, 1 errors found, 2 usage error,
+        # 3 language not set up. Anything above 1 is a hard failure.
+        rc=0
+        if [ "$FORMAT" = "text" ]; then
+          kotoshu check ${targets[@]+"${targets[@]}"} \
+            --language "$LANGUAGE" --format text ${args[@]+"${args[@]}"} \
+            | tee "$OUTPUT_PATH" || rc=${PIPESTATUS[0]}
+        else
+          kotoshu check ${targets[@]+"${targets[@]}"} \
+            --language "$LANGUAGE" --format "$FORMAT" ${args[@]+"${args[@]}"} \
+            > "$OUTPUT_PATH" || rc=$?
+        fi
+
+        # Failing error count from the report (new errors only when a
+        # baseline is set; suppressed entries are notes, not warnings).
+        error_count="$(ruby -e '
+          doc = File.read(ARGV[0])
+          count =
+            if ARGV[1] == "json"
+              require "json"
+              JSON.parse(doc)["errorCount"]
+            elsif ARGV[1] == "sarif"
+              require "json"
+              JSON.parse(doc)["runs"].sum do |run|
+                (run["results"] || []).count { |r| r["level"] == "warning" }
               end
-            rescue
-              puts 0
-            end' || echo 0)"
-          error_total=$((error_total + per_err_count))
-          ran_with_errors=1
-          [ "$per_err_count" -gt 0 ] || continue
+            else
+              doc[/(\d+) errors?\s*\z/, 1].to_i
+            end
+          puts count
+        ' "$OUTPUT_PATH" "$FORMAT" 2>/dev/null || echo 0)"
 
-          if [ "$FORMAT" = "sarif" ]; then
-            # Extract just the run object from per-file SARIF
-            run_obj="$(echo "$per_out" | ruby -rjson -e '
-              begin
-                doc = JSON.parse(STDIN.read)
-                puts (doc["runs"] || []).to_json
-              rescue
-                puts "[]"
-              end' || echo "[]")"
-            [ $first -eq 1 ] || printf "," >> "$combined_report"
-            # Strip the surrounding array brackets
-            inner="${run_obj#\[}"
-            inner="${inner%\]}"
-            printf "%s" "$inner" >> "$combined_report"
-          elif [ "$FORMAT" = "json" ]; then
-            [ $first -eq 1 ] || printf "," >> "$combined_report"
-            printf "%s" "$per_out" >> "$combined_report"
-          fi
-          first=0
-        done
-
-        if [ "$FORMAT" = "sarif" ]; then
-          printf "]}\n" >> "$combined_report"
-        elif [ "$FORMAT" = "json" ]; then
-          printf "]}\n" >> "$combined_report"
-        fi
-
-        if [ "$FORMAT" = "sarif" ] || [ "$FORMAT" = "json" ]; then
-          cp "$combined_report" "$OUTPUT_PATH"
-        else
-          : > "$OUTPUT_PATH"
-        fi
-
-        echo "error-count=$error_total" >> "$GITHUB_OUTPUT"
-        if [ "$FORMAT" = "sarif" ] || [ "$FORMAT" = "json" ]; then
-          echo "sarif-path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
-        else
+        echo "error-count=$error_count" >> "$GITHUB_OUTPUT"
+        if [ "$FORMAT" = "text" ]; then
           echo "sarif-path=" >> "$GITHUB_OUTPUT"
+        else
+          echo "sarif-path=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
         fi
 
-        if [ "$FAIL_ON_ERROR" = "true" ] && [ "$error_total" -gt 0 ]; then
-          echo "::error::Kotoshu found $error_total spelling error(s)"
+        if [ "$rc" -eq 0 ]; then
+          exit 0
+        fi
+        if [ "$rc" -eq 1 ]; then
+          if [ "$FAIL_ON_ERROR" != "true" ]; then
+            echo "::warning::Kotoshu found $error_count failing spelling error(s)"
+            exit 0
+          fi
+          echo "::error::Kotoshu found $error_count failing spelling error(s)"
           exit 1
         fi
+        echo "::error::kotoshu check exited with $rc (see log above; 2 = usage error, 3 = language not set up)"
+        exit "$rc"
 
     - name: Upload SARIF to Security tab
       if: inputs.format == 'sarif' && always()
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ inputs.output_path }}
-        category: kotoshu
+        category: ${{ inputs.category }}
 
     - name: Upload report artifact
       if: always() && (inputs.format == 'sarif' || inputs.format == 'json')
       uses: actions/upload-artifact@v4
       with:
-        name: kotoshu-report
+        name: kotoshu-report-${{ inputs.category }}
         path: ${{ inputs.output_path }}
