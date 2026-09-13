@@ -252,12 +252,19 @@ runs:
         echo "::error::kotoshu check exited with $rc (see log above; 2 = usage error, 3 = language not set up)"
         exit "$rc"
 
+    # Tolerant by design: a caller's workflow without the
+    # security-events write grant gets a visible warning instead of a
+    # red job - the CHECK verdict is already computed above, and the
+    # report artifact below always preserves the SARIF for download.
+    # Add `permissions: {contents: read, security-events: write}` to
+    # the calling workflow to enable the Security-tab upload.
     - name: Upload SARIF to Security tab
       if: inputs.format == 'sarif' && always()
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ inputs.output_path }}
         category: ${{ inputs.category }}
+      continue-on-error: true
 
     - name: Upload report artifact
       if: always() && (inputs.format == 'sarif' || inputs.format == 'json')
